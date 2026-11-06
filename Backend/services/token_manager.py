@@ -6,6 +6,8 @@ MAX_CONTEXT_BUDGET = 8000
 SUMMARY_BUDGET = 1500
 OUTPUT_RESERVE = 1000
 SAFETY_MARGIN = 200
+RECENT_HISTORY_BUDGET = 2500
+SUMMARY_TRIGGER_TOKENS = 5000
 
 def count_tokens(text: str) -> int:
     """
@@ -46,6 +48,26 @@ def select_recent_messages(messages: list, token_budget: int) -> list:
 
     return selected_messages
 
+def select_messages_for_summary(
+    messages: list,
+    recent_token_budget: int
+) -> list:
+
+    recent_messages = select_recent_messages(
+        messages,
+        recent_token_budget
+    )
+
+    recent_ids = {
+        message["_id"] for message in recent_messages
+    }
+
+    summary_messages = [
+        message for message in messages if message["_id"] not in recent_ids
+    ]
+
+    return summary_messages
+
 
 def calculate_history_budget(
     system_prompt: str,
@@ -65,7 +87,7 @@ def calculate_history_budget(
         - summary_tokens
         - user_tokens
         - OUTPUT_RESERVE
-        -SAFETY_MARGIN
+        - SAFETY_MARGIN
     )
 
     if available_tokens < 0:
@@ -106,7 +128,12 @@ def build_chat_context(
             "content": f"Conversation summary: {summary}"
         })
 
-    final_messages.extend(selected_history)
+    for message in selected_history:
+        final_messages.append({
+            "role": message["role"],
+            "content": message["content"]
+        })
+
 
     final_messages.append({
         "role": "user",

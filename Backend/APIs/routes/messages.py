@@ -9,8 +9,10 @@ from services.dependencies import active_session
 from services.llm import generate_response
 from groq import Groq,APIConnectionError,APITimeoutError,RateLimitError,APIStatusError
 from services.token_manager import build_chat_context
+from services.summarizer import update_conversation_summary
 from fastapi import Header
 import logging
+from services.redis_ratelimiter import check_rate_limit
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +28,9 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
     conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : current_user["_id"]})
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    
+
+    check_rate_limit(user_id=current_user["_id"],endpoint="create_message")
+
     user_message = message.model_dump()
 
     user_message["conversation_id"] = ObjectId(con_id)
@@ -53,8 +57,7 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
         existing_assistant_message = messages_db.find_one({"user_id": current_user["_id"], 
                                                            "conversation_id": ObjectId(con_id),
                                                            "in_reply_to_message_id": existing_message["_id"],
-                                                            "role": "assistant", 
-                                                            "status": MessageStatus.COMPLETED.value, 
+                                                            "role": "assistant",
                                                             "createdAt": {"$gte": existing_message["createdAt"]}})
 
         if not existing_assistant_message:
@@ -94,10 +97,40 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
                                         {"$set" : {"updatedAt" : datetime.now(timezone.utc)}} , 
                                         return_document=ReturnDocument.AFTER)
 
-    history = list(messages_db.find({"conversation_id": ObjectId(con_id),"user_id": current_user["_id"],
-                                     "role": {"$in": ["user", "assistant"]},"_id": {"$ne": res.inserted_id},
-                                     "is_deleted": False,"status" : MessageStatus.COMPLETED.value})
-                                     .sort("createdAt", -1).limit(50))
+    history_query = {
+            "conversation_id": ObjectId(con_id),
+            "user_id": current_user["_id"],
+            "role": {"$in": ["user", "assistant"]},
+            "_id": {"$ne": res.inserted_id},
+            "is_deleted": False,
+            "status": MessageStatus.COMPLETED.value
+        }
+
+    last_summary_id = conversation.get("summary_through_message_id")
+
+    if last_summary_id:
+        cursor_message = messages_db.find_one({
+                "_id": last_summary_id,
+                "conversation_id": ObjectId(con_id),
+                "user_id": current_user["_id"]
+            })
+
+        if not cursor_message:
+            raise HTTPException(
+                status_code=500,
+                detail="Conversation summary cursor could not be found"
+            )
+
+        history_query["$or"] = [
+                {"createdAt": {"$gt": cursor_message["createdAt"]}},
+                {
+                    "createdAt": cursor_message["createdAt"],
+                    "_id": {"$gt": last_summary_id}
+                }
+            ]
+
+
+    history = list(messages_db.find(history_query).sort([("createdAt", -1), ("_id", -1)]).limit(50))
 
     history.reverse()
 
@@ -105,7 +138,7 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
         You are a helpful AI assistant.
         Answer clearly and accurately.
         """
-    conversation_summary = ""
+    conversation_summary = conversation.get("summary", "")
 
     chat_history = build_chat_context( system_prompt=SYSTEM_PROMPT,
                                         summary=conversation_summary,
@@ -156,7 +189,8 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
         error_status = status.HTTP_502_BAD_GATEWAY
         error_message = "AI service returned an error."
 
-    except Exception:
+    except Exception as e:
+
         logger.exception("Unexpected LLM generation error")
         error_status = status.HTTP_502_BAD_GATEWAY
         error_message = "Failed to generate AI response."
@@ -166,20 +200,29 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
         error_message = None
 
     if error_status is not None:
-        #update the assistant_message to Failed
-        update_res = messages_db.update_one({"_id":assistant_res.inserted_id, "user_id": current_user["_id"], 
-                                "conversation_id": ObjectId(con_id) ,"status" : MessageStatus.PENDING.value},
-                                        {"$set" : 
-                                            {"status": MessageStatus.FAILED.value,
-                                             "updatedAt": datetime.now(timezone.utc)
-                                            }
-                                        }) 
+
+        update_res = messages_db.update_one(
+            {
+                "_id": assistant_res.inserted_id,
+                "user_id": current_user["_id"],
+                "conversation_id": ObjectId(con_id),
+                "status": MessageStatus.PENDING.value
+            },
+            {
+                "$set": {
+                    "status": MessageStatus.FAILED.value,
+                    "updatedAt": datetime.now(timezone.utc)
+                }
+            }
+        )
+
         if update_res.matched_count == 0:
-            logger.error("Unable to mark assistant message as failed")  
-            raise HTTPException(
-                status_code=status.HTTP_502_BAD_GATEWAY,
-                detail="Failed to generate AI response. Please try again."
-            )
+            logger.error("Unable to mark assistant message as failed")
+
+        raise HTTPException(
+            status_code=error_status,
+            detail=error_message
+        )
 
     #update the assistant_message to Completed
     update_res = messages_db.update_one({"_id" : assistant_res.inserted_id,"user_id": current_user["_id"], 
@@ -200,11 +243,18 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
     if not assistant_message_completed:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to retrieve assistant message")
 
-    conversations_db.find_one_and_update(
-        {"_id": ObjectId(con_id), "user_id": current_user["_id"]},
-        {"$set": {"updatedAt": datetime.now(timezone.utc)}},
-        return_document=ReturnDocument.AFTER)
-    
+    try:
+        conversation = conversations_db.find_one({
+            "_id": ObjectId(con_id),
+            "user_id": current_user["_id"]
+        })
+
+        update_conversation_summary(conversation)
+
+    except Exception:
+        logger.exception("Failed to update conversation summary")
+
+
     created_message["id"] = str(created_message.pop("_id"))
     created_message["user_id"] =  str(created_message.pop("user_id"))
     created_message["conversation_id"] = str(created_message.pop("conversation_id"))
@@ -212,7 +262,7 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
     assistant_message_completed["id"] = str(assistant_message_completed.pop("_id"))
     assistant_message_completed["user_id"] = str(assistant_message_completed.pop("user_id"))
     assistant_message_completed["conversation_id"] = str(assistant_message_completed.pop("conversation_id"))
-    assistant_message_completed["in_reply_to_message_id"] = str(assistant_message_completed.pop("in_reply_to_message_id"))
+    assistant_message_completed["in_reply_to_message_id"] = str(assistant_message_completed.pop("in_reply_to_message_id")) if assistant_message_completed.get("in_reply_to_message_id") else None
 
     return { "status_code" : status.HTTP_201_CREATED , "message" : "message created successfully" ,
              "data" : {"user_message" : created_message , "assistant_message" : assistant_message_completed}}
@@ -235,6 +285,8 @@ def get_all_messages(con_id : str , current_user = Depends(active_session)) :
         msg["id"] = str(msg.pop("_id"))
         msg["user_id"] = str(msg.pop("user_id"))
         msg["conversation_id"] = str(msg.pop("conversation_id"))
+        msg["in_reply_to_message_id"] = str(msg.pop("in_reply_to_message_id")) if msg.get("in_reply_to_message_id") else None
+        
         All_messages.append(msg)
     return { "status_code" : status.HTTP_200_OK , "message" : "Messages fetched successfully" , "Conversation" : conversation["title"] ,"data" : All_messages}
 

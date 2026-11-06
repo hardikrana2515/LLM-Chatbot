@@ -8,30 +8,45 @@ from services.auth import verify_access_token
 # Extract Bearer token from Authorization header
 bearer_scheme = HTTPBearer()
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
+def get_auth_context(credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme)):
     # Extract token string
     token = credentials.credentials
 
     # Verify token and extract user ID
-    user_id = verify_access_token(token)
+    user_id,session_id = verify_access_token(token)
+  
+    if not ObjectId.is_valid(user_id) or not ObjectId.is_valid(session_id):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="Invalid user ID or session ID in token !!!")
 
-    if not ObjectId.is_valid(user_id) :
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="Invalid user ID in token !!!")
-
-    current_user = user_db.find_one({"_id" : ObjectId(user_id)})
-
-    if current_user is None : 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED , detail="User no longer exists !!!")
-
-    return current_user
-
-def active_session(current_user : dict = Depends(get_current_user)) :
-
-    valid_session = sessions_db.find_one({"user_id" : current_user["_id"],
-                                          "revoked" : False,
-                                          "expiresAt" : {"$gt" : datetime.now(timezone.utc)}})
+    user_object_id = ObjectId(user_id)
+    session_object_id = ObjectId(session_id)
     
-    if not valid_session :
-                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="User does not logged-in !!")
+    current_user = user_db.find_one({"_id" : user_object_id})
 
+    if not current_user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="User no longer exists")
+
+    valid_session = sessions_db.find_one({
+        "_id": session_object_id,
+        "user_id": user_object_id,
+        "revoked": False,
+        "expiresAt": {"$gt": datetime.now(timezone.utc)}
+    })
+
+    if not valid_session:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Invalid, expired or revoked session")
+
+    return {
+        "user": current_user,
+        "session": valid_session
+        }
+
+def get_current_user(auth=Depends(get_auth_context)):
+    return auth["user"]
+
+def get_current_session(auth=Depends(get_auth_context)):
+    return auth["session"]
+
+def active_session(current_user = Depends(get_current_user)):
     return current_user
+

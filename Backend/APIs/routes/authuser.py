@@ -7,8 +7,8 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pwdlib import PasswordHash
 from services.auth import create_access_token,create_refresh_token,hash_refresh_token
-from services.dependencies import active_session
-
+from services.dependencies import active_session,get_current_session
+from services.auth import REFRESH_TOKEN_EXPIRE_DAYS
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
@@ -39,29 +39,29 @@ def login_user(user : Login_user) :
     exist_user = user_db.find_one({ "email" : user_data["email"]})
 
     if not exist_user :
-         raise HTTPException(status_code=401 , detail="Invalid email or password")
+        raise HTTPException(status_code=401 , detail="Invalid email or password")
 
     valid_pass = password_hash.verify(user_data["password"] ,exist_user["password"])
 
     if not valid_pass :
-         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED , detail="Invalid email or password")
-
-    valid_session = sessions_db.find_one({"user_id" : exist_user["_id"],
-                                              "revoked" : False,
-                                              "expiresAt" : {"$gt" : datetime.now(timezone.utc)}})
-    if valid_session :
-                    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="User already logged-in !!")
-
-    access_token = create_access_token(str(exist_user["_id"]))
+        raise HTTPException(status_code=401 , detail="Invalid email or password")
+    
     refresh_toekn = create_refresh_token()
 
-    sessions_db.insert_one({"user_id" : exist_user["_id"],
-                            "token_hash" : hash_refresh_token(refresh_toekn),
-                            "createdAt" : datetime.now(timezone.utc),
-                            "updatedAt" : datetime.now(timezone.utc),
-                            "expiresAt": datetime.now(timezone.utc) + timedelta(days=7),
-                            "revoked" : False
-                            })
+    session_data ={"user_id" : exist_user["_id"],
+                                            "token_hash" : hash_refresh_token(refresh_toekn),
+                                            "createdAt" : datetime.now(timezone.utc),
+                                            "updatedAt" : datetime.now(timezone.utc),
+                                            "expiresAt": datetime.now(timezone.utc) + timedelta(REFRESH_TOKEN_EXPIRE_DAYS),
+                                            "revoked" : False
+                                            }
+    session_result = sessions_db.insert_one(session_data)
+
+    session_id = str(session_result.inserted_id)
+
+    access_token = create_access_token(str(exist_user["_id"]),session_id)
+
+
     exist_user["id"] = str(exist_user.pop("_id"))
 
     res ={
@@ -122,13 +122,14 @@ def updatePassword(password : Update_password ,current_user=Depends(active_sessi
     return {"status_code" : status.HTTP_200_OK , "message" : "Password Updated Successfully !!!"}
 
 @router.post('/logout')
-def logout_user(current_user = Depends(active_session)) :
+def logout_user(current_session : dict = Depends(get_current_session)) :
 
-    result = sessions_db.update_many({"user_id" : current_user["_id"],
-                                "revoked" : False,
-                                "expiresAt" : {"$gt" : datetime.now(timezone.utc)}},
-                                {"$set" : {"revoked" : True, "updatedAt" : datetime.now(timezone.utc)}})
-
+    result = sessions_db.update_one({"_id": current_session["_id"],"revoked": False},
+        {"$set": {
+                "revoked": True,
+                "updatedAt": datetime.now(timezone.utc)
+            }})
+    
     if result.modified_count == 0 :
          raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED , detail="No active session found")
     
@@ -150,7 +151,7 @@ def refresh_access_token(data: RefreshTokenRequest):
     if not updated_session:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED,detail="Invalid or expired refresh token")
     
-    access_token = create_access_token(str(updated_session["user_id"]))
+    access_token = create_access_token(str(updated_session["user_id"]),str(updated_session["_id"]))
 
     return {
         "status_code": status.HTTP_200_OK,

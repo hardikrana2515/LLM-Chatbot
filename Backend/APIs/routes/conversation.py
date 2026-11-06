@@ -16,7 +16,9 @@ def create_conversation(conversation : CreateConversation , current_user = Depen
     my_conversation["user_id"] = current_user["_id"]
     my_conversation["createdAt"] = datetime.now(timezone.utc)
     my_conversation["updatedAt"] = datetime.now(timezone.utc)
-
+    my_conversation["summary"] = ""
+    my_conversation["summary_through_message_id"] = None
+    my_conversation["summary_updated_at"] = None
     res = conversations_db.insert_one(my_conversation)
 
     if not res.acknowledged :
@@ -43,6 +45,7 @@ def get_all_conversations(curent_user = Depends(active_session)):
     for con in conversations :
         con["id"] = str(con.pop("_id"))
         con["user_id"] = str(con.pop("user_id"))
+        con["summary_through_message_id"] = str(con.pop("summary_through_message_id")) if con.get("summary_through_message_id") else None
         conversation.append(con)
 
     return {"status_code":status.HTTP_200_OK ,"message":"succesfully fetched all conversations" ,"data" : conversation }
@@ -61,6 +64,7 @@ def get_conversation(con_id : str ,current_user = Depends(active_session)) :
 
     conversation["id"] = str(conversation.pop("_id"))
     conversation["user_id"] = str(conversation["user_id"])
+    conversation["summary_through_message_id"] = str(conversation.pop("summary_through_message_id")) if conversation.get("summary_through_message_id") else None
 
     return {"status_code" : status.HTTP_200_OK , "message" : "Fetch conversation successfully" , "data" : conversation}
 
@@ -100,13 +104,13 @@ def delete_conversation(con_id :str ,current_user = Depends(active_session)) :
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
-    messages_db.delete_many({"conversation_id" : ObjectId(con_id)})
+    messages_db.delete_many({"conversation_id" : ObjectId(con_id),"user_id" : current_user["_id"]})
+
 
     deleted_conversation = conversations_db.delete_one({"_id" : ObjectId(con_id), "user_id" : current_user["_id"]})
 
-    if not deleted_conversation :
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT ,detail="Conversation Not Deleted successfully ,Try again")
+    if  deleted_conversation.deleted_count != 1 :
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT ,detail="Conversation Not Deleted successfully ,Please Try again")
 
-    return {
-        "status_code": status.HTTP_200_OK,"message": "Conversation deleted successfully"}
+    return {"status_code": status.HTTP_200_OK,"message": "Conversation deleted successfully"}
 
