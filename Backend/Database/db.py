@@ -27,8 +27,7 @@ llm_usage_db = db["llm_usage"]
 #make email unique (like pkey)
 user_db.create_index("email", unique=True)
 
-sessions_db.create_index("expires_at",expireAfterSeconds=0)
-
+sessions_db.create_index("expiresAt", expireAfterSeconds=0)
 
 messages_db.create_index([("conversation_id", 1),("user_id", 1),("client_message_id", 1)],
                          unique=True,

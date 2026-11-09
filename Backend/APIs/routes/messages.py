@@ -3,7 +3,7 @@ from datetime import datetime,timezone
 from Model.schema import CreateMessages,MessageStatus
 from Database.db import messages_db,conversations_db
 from pymongo import ReturnDocument
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import DuplicateKeyError,ConnectionFailure
 from bson import ObjectId
 from services.dependencies import active_session
 from services.llm import generate_response
@@ -27,12 +27,91 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
 
     if not valid_id :
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST ,detail="Invalid conversation iD in token !!!")
+    
+    try:
+        conversation = conversations_db.find_one({
+            "_id": ObjectId(con_id),
+            "user_id": current_user["_id"]
+        })
 
-    conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : current_user["_id"]})
+    except ConnectionFailure:
+        logger.exception(
+            "MongoDB connection failed while fetching conversation"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is temporarily unavailable. Please try again."
+        )
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
     check_rate_limit(identifier=str(current_user["_id"]),endpoint="create_message")
+
+    try :
+        # Check idempotency before reserving tokens.
+        existing_message = messages_db.find_one({
+            "user_id": current_user["_id"],
+            "client_message_id": idempotency_key,
+            "conversation_id": ObjectId(con_id),
+            "role": "user"
+        })
+    except ConnectionFailure :
+        logger.exception(
+            "MongoDB connection failed during idempotency lookup"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is temporarily unavailable. Please try again."
+        )
+
+    if existing_message:
+
+        existing_assistant_message = messages_db.find_one({
+            "user_id": current_user["_id"],
+            "conversation_id": ObjectId(con_id),
+            "in_reply_to_message_id": existing_message["_id"],
+            "role": "assistant"
+        })
+
+        if not existing_assistant_message:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This request is already being processed. Retry using the same key."
+            )
+
+        if existing_assistant_message["status"] == MessageStatus.PENDING.value:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Your AI response is still being generated."
+            )
+
+        if existing_assistant_message["status"] == MessageStatus.FAILED.value:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="The previous AI generation failed. Please start a new request."
+            )
+
+        existing_message["id"] = str(existing_message.pop("_id"))
+        existing_message["user_id"] = str(existing_message.pop("user_id"))
+        existing_message["conversation_id"] = str(existing_message.pop("conversation_id"))
+
+        existing_assistant_message["id"] = str(existing_assistant_message.pop("_id"))
+        existing_assistant_message["user_id"] = str(existing_assistant_message.pop("user_id"))
+        existing_assistant_message["conversation_id"] = str(existing_assistant_message.pop("conversation_id"))
+        existing_assistant_message["in_reply_to_message_id"] = str(
+            existing_assistant_message.pop("in_reply_to_message_id")
+        )
+
+        return {
+            "status_code": status.HTTP_200_OK,
+            "message": "Existing response returned successfully",
+            "data": {
+                "user_message": existing_message,
+                "assistant_message": existing_assistant_message
+            }
+        }
 
     user_message = message.model_dump()
 
@@ -46,65 +125,10 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
     user_message["updatedAt"] = datetime.now(timezone.utc)
     user_message["deletedAt"] = None
 
-    try :
-        res = messages_db.insert_one(user_message)
-
-    except DuplicateKeyError:
-
-        existing_message = messages_db.find_one({"user_id": current_user["_id"], "client_message_id": idempotency_key,
-                                                  "conversation_id": ObjectId(con_id) ,"role" : "user"
-                                                  })
-        if not existing_message:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR , detail="Original message was not found.")
-
-        existing_assistant_message = messages_db.find_one({"user_id": current_user["_id"], 
-                                                           "conversation_id": ObjectId(con_id),
-                                                           "in_reply_to_message_id": existing_message["_id"],
-                                                            "role": "assistant",
-                                                            "createdAt": {"$gte": existing_message["createdAt"]}})
-
-        if not existing_assistant_message:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT , detail="This request is already being processed. Retry using the same key.")
-        
-        if  existing_assistant_message["status"] == MessageStatus.PENDING.value:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT , detail="Your AI response is still being generated.")
-
-        if existing_assistant_message["status"] == MessageStatus.FAILED.value:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT , detail="The previous AI generation failed. Please start a new request.")
-
-        existing_message["id"] = str(existing_message.pop("_id"))
-        existing_message["user_id"] = str(existing_message.pop("user_id"))
-        existing_message["conversation_id"] = str(existing_message.pop("conversation_id"))
-
-        existing_assistant_message["id"] = str(existing_assistant_message.pop("_id"))
-        existing_assistant_message["user_id"] = str(existing_assistant_message.pop("user_id"))
-        existing_assistant_message["conversation_id"] = str(existing_assistant_message.pop("conversation_id"))
-        existing_assistant_message["in_reply_to_message_id"] = str(existing_assistant_message.pop("in_reply_to_message_id"))
-
-
-        return {
-            "status_code": status.HTTP_200_OK,
-            "message": "Existing response returned successfully",
-            "data": {
-                "user_message": existing_message,
-                "assistant_message": existing_assistant_message
-            }
-        }
-
-    created_message = messages_db.find_one({"_id" : res.inserted_id ,"user_id" : current_user["_id"] ,"conversation_id" : ObjectId(con_id)})
-
-    if not created_message :
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND , detail="Conversation not found")
-
-    conversations_db.find_one_and_update({"_id" : ObjectId(con_id) ,"user_id" : current_user["_id"]} ,
-                                        {"$set" : {"updatedAt" : datetime.now(timezone.utc)}} , 
-                                        return_document=ReturnDocument.AFTER)
-
     history_query = {
             "conversation_id": ObjectId(con_id),
             "user_id": current_user["_id"],
             "role": {"$in": ["user", "assistant"]},
-            "_id": {"$ne": res.inserted_id},
             "is_deleted": False,
             "status": MessageStatus.COMPLETED.value
         }
@@ -133,11 +157,26 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
             ]
 
 
-    history = list(messages_db.find(history_query).sort([("createdAt", -1), ("_id", -1)]).limit(50))
+    try:
+        history = list(
+            messages_db.find(history_query)
+            .sort([("createdAt", -1), ("_id", -1)])
+            .limit(50)
+        )
+
+    except ConnectionFailure:
+        logger.exception(
+            "MongoDB connection failed during message history retrieval"
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is temporarily unavailable. Please try again."
+        )
 
     history.reverse()
 
-    SYSTEM_PROMPT = """
+    SYSTEM_PROMPT = """ 
         You are a helpful AI assistant.
         Answer clearly and accurately.
         """
@@ -166,6 +205,91 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
 
     reservation_id = reservation["reservation_id"]
 
+    try:
+        res = messages_db.insert_one(user_message)
+
+    except DuplicateKeyError:
+        release_tokens(
+            user_id=str(current_user["_id"]),
+            reservation_id=reservation_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This request is already being processed."
+        )
+    except ConnectionFailure:
+        logger.exception(
+            "MongoDB connection failed during user message insertion"
+        )
+
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release reservation after MongoDB connection failure"
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is temporarily unavailable. Please try again."
+        )
+
+    except Exception:
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception("Failed to release reservation after user message insertion error")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create user message"
+        )
+
+    if not res.acknowledged:
+        release_tokens(
+            user_id=str(current_user["_id"]),
+            reservation_id=reservation_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="User message insertion was not acknowledged"
+        )
+
+    created_message = messages_db.find_one({
+        "_id": res.inserted_id,
+        "user_id": current_user["_id"],
+        "conversation_id": ObjectId(con_id)
+    })
+
+    if not created_message:
+        release_tokens(
+            user_id=str(current_user["_id"]),
+            reservation_id=reservation_id
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve created user message"
+        )
+
+    conversations_db.update_one(
+        {
+            "_id": ObjectId(con_id),
+            "user_id": current_user["_id"]
+        },
+        {
+            "$set": {
+                "updatedAt": datetime.now(timezone.utc)
+            }
+        }
+    )
+
+
     assistant_message = {
             "conversation_id": ObjectId(con_id),
             "user_id": current_user["_id"],
@@ -181,6 +305,26 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
 
     try:
         assistant_res = messages_db.insert_one(assistant_message)
+
+    except ConnectionFailure:
+        logger.exception(
+            "MongoDB connection failed during assistant message insertion"
+        )
+
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release reservation after assistant insertion failure"
+            )
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database service is temporarily unavailable. Please try again."
+        )
 
     except Exception:
         try:
@@ -198,7 +342,6 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
             status_code=500,
             detail="Failed to create assistant message"
         )
-
 
     if not assistant_res.acknowledged:
         try:
@@ -375,6 +518,7 @@ def get_all_messages(con_id : str , current_user = Depends(active_session)) :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
     check_rate_limit(identifier=current_user["_id"],endpoint="fetch_messages")
+
     messages = list(messages_db.find({"user_id" : current_user["_id"] ,"conversation_id" : ObjectId(con_id) , "is_deleted" : False}).sort("createdAt",1))
 
     All_messages = []

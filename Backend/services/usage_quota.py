@@ -3,15 +3,14 @@ import math
 from datetime import datetime, timezone, timedelta
 import uuid
 from fastapi import HTTPException, status
-
+from config.usage_limits import (USAGE_LIMITS,RESERVATION_LEASE_SECONDS)
 from Database.redis_db import redis_client
-from config.usage_limits import USAGE_LIMITS
-
 
 RESERVE_TOKENS_SCRIPT = """
 local daily_key = KEYS[1]
 local monthly_key = KEYS[2]
 local reservation_key = KEYS[3]
+local expiry_index_key = KEYS[4]
 
 local requested = tonumber(ARGV[1])
 local daily_limit = tonumber(ARGV[2])
@@ -53,8 +52,18 @@ redis.call(
     'daily_key', daily_key,
     'monthly_key', monthly_key,
     'status', 'reserved',
-    'created_at', ARGV[7]
+    'created_at', ARGV[7],
+    'expires_at', ARGV[8]
 )
+
+-- Track reservation expiration.
+redis.call(
+    'ZADD',
+    expiry_index_key,
+    ARGV[8],
+    ARGV[6]
+)
+
 return {1, daily_used, monthly_used, 0}
 """
 
@@ -63,6 +72,7 @@ RECONCILE_TOKENS_SCRIPT = """
 local reservation_key = KEYS[1]
 local daily_key = KEYS[2]
 local monthly_key = KEYS[3]
+local expiry_index_key = KEYS[4]
 
 local actual_tokens = tonumber(ARGV[1])
 local daily_limit = tonumber(ARGV[2])
@@ -125,6 +135,13 @@ redis.call(
     'reconciled_at', reconciled_at
 )
 
+-- Remove finalized reservation from expiration index.
+redis.call(
+    'ZREM',
+    expiry_index_key,
+    redis.call('HGET', reservation_key, 'reservation_id')
+)
+
 return {
     1,
     daily_used,
@@ -139,6 +156,7 @@ RELEASE_TOKENS_SCRIPT = """
 local reservation_key = KEYS[1]
 local daily_key = KEYS[2]
 local monthly_key = KEYS[3]
+local expiry_index_key = KEYS[4]
 
 local released_at = ARGV[1]
 
@@ -194,8 +212,150 @@ redis.call(
     'released_at', released_at
 )
 
+-- Remove finalized reservation from expiration index.
+redis.call(
+    'ZREM',
+    expiry_index_key,
+    redis.call('HGET', reservation_key, 'reservation_id')
+)
+
 return {1, daily_used, monthly_used, reserved_tokens}
 """
+
+CLEANUP_EXPIRED_RESERVATION_SCRIPT = """
+local reservation_key = KEYS[1]
+local daily_key = KEYS[2]
+local monthly_key = KEYS[3]
+local expiry_index_key = KEYS[4]
+
+local reservation_id = ARGV[1]
+local now = tonumber(ARGV[2])
+
+-- Check whether reservation exists.
+if redis.call('EXISTS', reservation_key) == 0 then
+    redis.call('ZREM', expiry_index_key, reservation_id)
+    return {0, 0, 0}
+end
+
+local reservation_status = redis.call(
+    'HGET', reservation_key, 'status'
+)
+
+-- Never release an already finalized reservation.
+if reservation_status ~= 'reserved' then
+    redis.call('ZREM', expiry_index_key, reservation_id)
+    return {2, 0, 0}
+end
+
+local expires_at = tonumber(
+    redis.call('HGET', reservation_key, 'expires_at')
+)
+
+-- Reservation has not expired yet.
+if not expires_at or expires_at > now then
+    return {0, 0, 0}
+end
+
+local reserved_tokens = tonumber(
+    redis.call('HGET', reservation_key, 'requested_tokens')
+)
+
+local stored_daily_key = redis.call(
+    'HGET', reservation_key, 'daily_key'
+)
+
+local stored_monthly_key = redis.call(
+    'HGET', reservation_key, 'monthly_key'
+)
+
+-- Verify counter keys.
+if stored_daily_key ~= daily_key
+or stored_monthly_key ~= monthly_key then
+    return {-2, 0, 0}
+end
+
+local daily_used = 0
+local monthly_used = 0
+
+-- Release tokens from counters that still exist.
+if redis.call('EXISTS', daily_key) == 1 then
+    daily_used = redis.call('INCRBY', daily_key, -reserved_tokens)
+end
+
+if redis.call('EXISTS', monthly_key) == 1 then
+    monthly_used = redis.call('INCRBY', monthly_key, -reserved_tokens)
+end
+
+-- Mark reservation as expired.
+redis.call(
+    'HSET',
+    reservation_key,
+    'status', 'expired',
+    'expired_at', now
+)
+
+-- Remove from expiration index.
+redis.call('ZREM', expiry_index_key, reservation_id)
+
+return {1, daily_used, monthly_used}
+"""
+
+def cleanup_expired_reservations(user_id: str):
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    expiry_index_key = (
+        f"usage:{{{user_id}}}:reservations:expiry"
+    )
+
+    try:
+        # Find all reservation IDs whose lease has expired.
+        expired_ids = redis_client.zrangebyscore(
+            expiry_index_key,
+            "-inf",
+            now
+        )
+
+        cleaned_count = 0
+
+        for reservation_id in expired_ids:
+            reservation_key = (
+                f"usage:{{{user_id}}}:reservation:{reservation_id}"
+            )
+
+            # Retrieve the original counter keys.
+            metadata = redis_client.hgetall(reservation_key)
+
+            if not metadata:
+                redis_client.zrem(
+                    expiry_index_key,
+                    reservation_id
+                )
+                continue
+
+            daily_key = metadata["daily_key"]
+            monthly_key = metadata["monthly_key"]
+
+            result = redis_client.eval(
+                CLEANUP_EXPIRED_RESERVATION_SCRIPT,
+                4,
+                reservation_key,
+                daily_key,
+                monthly_key,
+                expiry_index_key,
+                reservation_id,
+                now
+            )
+
+            if int(result[0]) == 1:
+                cleaned_count += 1
+
+        return cleaned_count
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Unable to recover expired token reservations."
+        ) from exc
 
 def reserve_tokens(user_id: str, requested_tokens: int):
     # Validate requested token amount.
@@ -206,18 +366,19 @@ def reserve_tokens(user_id: str, requested_tokens: int):
     ):
         raise ValueError("requested_tokens must be a positive integer")
 
+    # Recover expired reservations before creating a new reservation.
+    cleanup_expired_reservations(user_id)
+
     now = datetime.now(timezone.utc)
 
     # Calculate next UTC midnight.
-    next_day = now.replace(
-        hour=0, minute=0, second=0, microsecond=0
-    ).replace(
+    # Calculate next UTC midnight.
+    next_day = (now + timedelta(days=1)).replace(
         hour=0,
         minute=0,
         second=0,
         microsecond=0
-    ) + timedelta(days=1) 
-    next_day = next_day + timedelta(days=1)
+    )
 
     # Calculate first day of next month.
     if now.month == 12:
@@ -253,20 +414,28 @@ def reserve_tokens(user_id: str, requested_tokens: int):
         f"usage:{{{user_id}}}:reservation:{reservation_id}"
     )
 
+    expiry_index_key = (
+        f"usage:{{{user_id}}}:reservations:expiry"
+    )
+
+    expires_at = int(now.timestamp()) + RESERVATION_LEASE_SECONDS
+
     try:
         result = redis_client.eval(
             RESERVE_TOKENS_SCRIPT,
-            3,
+            4,
             daily_key,
             monthly_key,
             reservation_key,
+            expiry_index_key,
             requested_tokens,
             USAGE_LIMITS["daily_tokens"],
             USAGE_LIMITS["monthly_tokens"],
             daily_ttl,
             monthly_ttl,
             reservation_id,
-            int(now.timestamp())
+            int(now.timestamp()),
+            expires_at
         )
 
     except Exception as exc:
@@ -318,7 +487,6 @@ def reserve_tokens(user_id: str, requested_tokens: int):
         )
     }
 
-
 def reconcile_tokens(
     user_id: str,
     reservation_id: str,
@@ -334,7 +502,9 @@ def reconcile_tokens(
     reservation_key = (
         f"usage:{{{user_id}}}:reservation:{reservation_id}"
     )
-
+    expiry_index_key = (
+        f"usage:{{{user_id}}}:reservations:expiry"
+    )
     try:
         # Retrieve the counter keys stored during reservation.
         metadata = redis_client.hgetall(reservation_key)
@@ -349,17 +519,18 @@ def reconcile_tokens(
         monthly_key = metadata["monthly_key"]
 
         result = redis_client.eval(
-            RECONCILE_TOKENS_SCRIPT,
-            3,
-            reservation_key,
-            daily_key,
-            monthly_key,
-            actual_tokens,
-            USAGE_LIMITS["daily_tokens"],
-            USAGE_LIMITS["monthly_tokens"],
-            int(datetime.now(timezone.utc).timestamp())
-        )
-
+                RECONCILE_TOKENS_SCRIPT,
+                4,
+                reservation_key,
+                daily_key,
+                monthly_key,
+                expiry_index_key,
+                actual_tokens,
+                USAGE_LIMITS["daily_tokens"],
+                USAGE_LIMITS["monthly_tokens"],
+                int(datetime.now(timezone.utc).timestamp())
+            )
+        
     except HTTPException:
         raise
 
@@ -410,6 +581,10 @@ def release_tokens(user_id: str, reservation_id: str):
         f"usage:{{{user_id}}}:reservation:{reservation_id}"
     )
 
+    expiry_index_key = (
+        f"usage:{{{user_id}}}:reservations:expiry"
+    )
+
     try:
         metadata = redis_client.hgetall(reservation_key)
 
@@ -423,14 +598,14 @@ def release_tokens(user_id: str, reservation_id: str):
         monthly_key = metadata["monthly_key"]
 
         result = redis_client.eval(
-            RELEASE_TOKENS_SCRIPT,
-            3,
-            reservation_key,
-            daily_key,
-            monthly_key,
-            int(datetime.now(timezone.utc).timestamp())
-        )
-
+                RELEASE_TOKENS_SCRIPT,
+                4,
+                reservation_key,
+                daily_key,
+                monthly_key,
+                expiry_index_key,
+                int(datetime.now(timezone.utc).timestamp())
+            )
     except HTTPException:
         raise
 
