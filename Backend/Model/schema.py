@@ -84,7 +84,7 @@ class CreateConversation(BaseModel):
     def validate_title(cls,value :str) :
         value = value.strip()
 
-        if 2 < len(value):
+        if len(value)<2:
             raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT ,detail="Conversation title must contain at least 2 characters.")
 
         return value

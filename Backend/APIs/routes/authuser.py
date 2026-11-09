@@ -1,4 +1,4 @@
-from fastapi import HTTPException,status,Depends,APIRouter
+from fastapi import HTTPException,status,Depends,APIRouter,Request
 from datetime import datetime,timezone,timedelta
 from Model.schema import Login_user,Create_user,Update_password,Update_user,RefreshTokenRequest
 from Database.db import user_db,sessions_db
@@ -6,16 +6,21 @@ from bson import ObjectId
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from pwdlib import PasswordHash
+import hashlib
 from services.auth import create_access_token,create_refresh_token,hash_refresh_token
 from services.dependencies import active_session,get_current_session
 from services.auth import REFRESH_TOKEN_EXPIRE_DAYS
+from services.redis_ratelimiter import check_rate_limit
 
 router = APIRouter(prefix="/auth", tags=["Authentication"])
 
 password_hash = PasswordHash.recommended()
 
 @router.post('/signup')
-def signup(user : Create_user) :
+def signup(user : Create_user,request : Request) :
+
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(identifier=client_ip , endpoint="signup")
     user_data = user.model_dump()
 
     user_data["password"] = password_hash.hash(user_data["password"])
@@ -33,13 +38,24 @@ def signup(user : Create_user) :
         raise HTTPException(status_code=409 , detail="Eamil Already exist , try different one !!!" )
         
 @router.post('/login')
-def login_user(user : Login_user) :
-    user_data = user.model_dump()
+def login_user(user : Login_user ,request : Request) :
 
-    exist_user = user_db.find_one({ "email" : user_data["email"]})
+    client_ip = request.client.host if request.client else "unknown"
+
+    check_rate_limit(identifier=client_ip , endpoint="login_ip")
+
+    
+    user_data = user.model_dump()
+    normalized_email = user_data["email"].strip().lower()
+
+    account_key = hashlib.sha256(normalized_email.encode("utf-8")).hexdigest()
+
+    check_rate_limit(identifier=account_key ,endpoint="login_account")
+    exist_user = user_db.find_one({ "email" : normalized_email})
 
     if not exist_user :
         raise HTTPException(status_code=401 , detail="Invalid email or password")
+
 
     valid_pass = password_hash.verify(user_data["password"] ,exist_user["password"])
 
@@ -136,8 +152,10 @@ def logout_user(current_session : dict = Depends(get_current_session)) :
     return {"status_code": status.HTTP_200_OK,"message": "User logged out successfully"}
 
 @router.post("/refresh")
-def refresh_access_token(data: RefreshTokenRequest):
+def refresh_access_token(data: RefreshTokenRequest ,request : Request):
 
+    client_ip = request.client.host if request.client else "unknown"
+    check_rate_limit(identifier=client_ip , endpoint="refresh")
     token_hash = hash_refresh_token(data.refresh_token)
 
     new_refresh_token = create_refresh_token()

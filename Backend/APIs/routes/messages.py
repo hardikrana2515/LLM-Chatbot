@@ -8,8 +8,11 @@ from bson import ObjectId
 from services.dependencies import active_session
 from services.llm import generate_response
 from groq import Groq,APIConnectionError,APITimeoutError,RateLimitError,APIStatusError
-from services.token_manager import build_chat_context
+from services.token_manager import build_chat_context,count_message_tokens,SAFETY_MARGIN
+from services.usage_quota import reserve_tokens,reconcile_tokens,release_tokens
+from config.usage_limits import USAGE_LIMITS
 from services.summarizer import update_conversation_summary
+from services.usage_tracker import record_llm_usage
 from fastapi import Header
 import logging
 from services.redis_ratelimiter import check_rate_limit
@@ -29,7 +32,7 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
-    check_rate_limit(user_id=current_user["_id"],endpoint="create_message")
+    check_rate_limit(identifier=str(current_user["_id"]),endpoint="create_message")
 
     user_message = message.model_dump()
 
@@ -145,6 +148,24 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
                                         conversation_history=history,
                                         current_user_message=message.content)
 
+    # Estimate tokens required for this LLM request
+    estimated_prompt_tokens = count_message_tokens(chat_history)
+
+
+    requested_tokens = (
+        estimated_prompt_tokens
+        + USAGE_LIMITS["max_output_tokens"]
+        + SAFETY_MARGIN
+    )
+
+    # Reserve tokens before calling the LLM
+    reservation = reserve_tokens(
+        user_id=str(current_user["_id"]),
+        requested_tokens=requested_tokens
+    )
+
+    reservation_id = reservation["reservation_id"]
+
     assistant_message = {
             "conversation_id": ObjectId(con_id),
             "user_id": current_user["_id"],
@@ -158,17 +179,57 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
             "deletedAt": None
         }
 
-    assistant_res = messages_db.insert_one(assistant_message)
+    try:
+        assistant_res = messages_db.insert_one(assistant_message)
 
-    if not assistant_res.acknowledged :
-         raise HTTPException(status_code=500,detail="Failed to create assistant message")
+    except Exception:
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release reservation after assistant insertion error: %s",
+                reservation_id
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create assistant message"
+        )
+
+
+    if not assistant_res.acknowledged:
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release reservation after unacknowledged insertion: %s",
+                reservation_id
+            )
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create assistant message"
+        )
 
     try:
-        assistant_response = generate_response(chat_history)
+        llm_result = generate_response(chat_history)
+        assistant_response = llm_result.get("content")
 
-        if not assistant_response or not assistant_response.strip():
+        usage_data = llm_result.get("usage", {})
+        timing_data = llm_result.get("timing", {})
+
+        model_name = llm_result.get("model")
+        request_id = llm_result.get("request_id")
+
+        if not isinstance(assistant_response, str) or not assistant_response.strip():
             raise ValueError("LLM returned an empty response")
-    
+
     except APITimeoutError:
         logger.exception("Groq API timeout")
         error_status = status.HTTP_504_GATEWAY_TIMEOUT
@@ -189,17 +250,27 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
         error_status = status.HTTP_502_BAD_GATEWAY
         error_message = "AI service returned an error."
 
-    except Exception as e:
-
+    except Exception:
         logger.exception("Unexpected LLM generation error")
         error_status = status.HTTP_502_BAD_GATEWAY
         error_message = "Failed to generate AI response."
 
-    else :
+    else:
         error_status = None
         error_message = None
 
     if error_status is not None:
+
+        try:
+            release_tokens(
+                user_id=str(current_user["_id"]),
+                reservation_id=reservation_id
+            )
+        except Exception:
+            logger.exception(
+                "Failed to release token reservation: %s",
+                reservation_id
+            )
 
         update_res = messages_db.update_one(
             {
@@ -223,6 +294,30 @@ def message(con_id : str , message : CreateMessages ,idempotency_key: str = Head
             status_code=error_status,
             detail=error_message
         )
+    
+    try:
+        reconciliation = reconcile_tokens(
+            user_id=str(current_user["_id"]),
+            reservation_id=reservation_id,
+            actual_tokens=usage_data["total_tokens"]
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to reconcile token reservation: %s",
+            reservation_id
+        )
+    
+    try:
+        record_llm_usage(
+            user_id=current_user["_id"],
+            conversation_id=ObjectId(con_id),
+            message_id=assistant_res.inserted_id,
+            llm_result=llm_result
+        )
+
+    except Exception:
+        logger.exception("Failed to record LLM usage")
 
     #update the assistant_message to Completed
     update_res = messages_db.update_one({"_id" : assistant_res.inserted_id,"user_id": current_user["_id"], 
@@ -274,10 +369,12 @@ def get_all_messages(con_id : str , current_user = Depends(active_session)) :
     if not valid_id :
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="Invalid conversation iD in token !!!")
 
-    conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : current_user["_id"]})
+
+    conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : str(current_user["_id"])})
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
-    
+
+    check_rate_limit(identifier=current_user["_id"],endpoint="fetch_messages")
     messages = list(messages_db.find({"user_id" : current_user["_id"] ,"conversation_id" : ObjectId(con_id) , "is_deleted" : False}).sort("createdAt",1))
 
     All_messages = []

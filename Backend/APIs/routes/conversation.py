@@ -5,6 +5,7 @@ from Database.db import conversations_db,messages_db
 from pymongo import ReturnDocument
 from bson import ObjectId
 from services.dependencies import active_session
+from services.redis_ratelimiter import check_rate_limit
 
 
 router = APIRouter(prefix="/conversation", tags=["Conversations"])
@@ -36,6 +37,8 @@ def create_conversation(conversation : CreateConversation , current_user = Depen
 
 @router.get('/all_conversations')
 def get_all_conversations(curent_user = Depends(active_session)):
+
+    check_rate_limit(identifier=str(curent_user["_id"]),endpoint="fetch_conversations")
 
     conversations = list(conversations_db.find({"user_id" : curent_user["_id"]}).sort("updatedAt",-1))
 
