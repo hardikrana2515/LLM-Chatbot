@@ -1,13 +1,10 @@
 
 from groq import Groq
-import os
-from dotenv import load_dotenv
 from config.usage_limits import USAGE_LIMITS
+from config.settings import settings
 
-load_dotenv()
-
-api_key = os.getenv("GROQ_API_KEY")
-MODEL_NAME = os.getenv("GROQ_MODEL")
+api_key = settings.groq_api_key.get_secret_value()
+MODEL_NAME = settings.groq_model
 
 if not api_key:
     raise RuntimeError("GROQ_API_KEY is missing")

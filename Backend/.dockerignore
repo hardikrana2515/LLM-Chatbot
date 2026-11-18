@@ -1,0 +1,33 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Python virtual environments
+.venv/
+.venv-clean/
+venv/
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Pytest cache and tests
+.pytest_cache/
+test/
+
+# Git
+.git/
+
+# Backup and development-only files
+requirements-backup.txt
+requirements-dev.txt
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db

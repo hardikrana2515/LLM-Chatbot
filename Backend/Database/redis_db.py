@@ -1,11 +1,8 @@
 import redis
-import os
-from dotenv import load_dotenv
 from datetime import datetime,timezone
+from config.settings import settings
 
-load_dotenv()
-
-REDIS_URL = os.getenv("REDIS_URL")
+REDIS_URL = settings.redis_url.get_secret_value()
 
 if not REDIS_URL:
     raise RuntimeError("REDIS_URL is missing from environment variables")

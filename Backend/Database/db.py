@@ -1,21 +1,13 @@
 from pymongo import MongoClient
-from dotenv import load_dotenv
-import os
+from config.settings import settings
 
 
-load_dotenv()
 
-#connection
-uri = os.getenv("MONGODB_URI")
-db_name = os.getenv("DATABASE_NAME")
 
-if not uri or not db_name:
-    raise ValueError("MongoDB environment variables are missing")
-
-client = MongoClient(uri ,serverSelectionTimeoutMS=5000)
+client = MongoClient(settings.mongodb_uri.get_secret_value() ,serverSelectionTimeoutMS=5000)
 
 #Database
-db = client[db_name]
+db = client[settings.database_name]
 
 #collections
 conversations_db = db["conversations"]

@@ -1,20 +1,16 @@
-import os
 import jwt
 import secrets
 import hashlib
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
 from fastapi import HTTPException, status
 from jwt.exceptions import InvalidTokenError
+from config.settings import settings
 
+JWT_SECRET_KEY = settings.jwt_secret_key.get_secret_value()
+JWT_ALGORITHM = settings.jwt_algorithm
 
-load_dotenv()
-
-JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
-JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
-
-ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "10"))
-REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+ACCESS_TOKEN_EXPIRE_MINUTES = settings.access_token_expire_minutes
+REFRESH_TOKEN_EXPIRE_DAYS = settings.refresh_token_expire_days
 
 if not JWT_SECRET_KEY:
     raise RuntimeError("JWT_SECRET_KEY is missing")
