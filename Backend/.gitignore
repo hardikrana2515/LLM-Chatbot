@@ -1,9 +1,32 @@
+# Environment variables and secrets
 .env
 .env.*
+!.env.example
+
+# Python virtual environments
 .venv/
+.venv-clean/
 venv/
+
+# Python cache
 __pycache__/
-*.pyc
 *.py[cod]
+
+# Testing cache
 .pytest_cache/
-test/
+.coverage
+htmlcov/
+
+# Git
+.git/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+
+# Backup files
+requirements-backup.txt
