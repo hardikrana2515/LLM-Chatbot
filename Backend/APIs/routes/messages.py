@@ -513,7 +513,7 @@ def get_all_messages(con_id : str , current_user = Depends(active_session)) :
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED ,detail="Invalid conversation iD in token !!!")
 
 
-    conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : str(current_user["_id"])})
+    conversation = conversations_db.find_one({"_id" : ObjectId(con_id),"user_id" : current_user["_id"]})
     if not conversation :
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Conversation not found")
 
